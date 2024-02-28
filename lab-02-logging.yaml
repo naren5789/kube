@@ -1,0 +1,247 @@
+---
+apiVersion: apps/v1
+kind: Namespace
+metadata:
+  name: kube-instrumentation
+  labels:
+    name: kube-instrumentation
+---
+apiVersion: apps/v1
+kind: Service
+metadata:
+  name: es-k8s-logging
+  namespace: kube-instrumentation
+  labels:
+    app: elasticsearch
+    function: logging
+spec:
+  selector:
+    app: elasticsearch
+    function: logging
+  type: NodePort
+  ports:
+    - protocol: TCP
+      port: 9200
+      nodePort: 30920
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: es-k8s-logging
+  namespace: kube-instrumentation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elasticsearch
+      function: logging
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+        function: logging
+    spec:
+      containers:
+      - name: elasticsearch
+        image: docker.elastic.co/elasticsearch/elasticsearch:5.5.1
+        command: ["bin/elasticsearch"]
+        args: ["-Ehttp.host=0.0.0.0", "-Etransport.host=127.0.0.1", "-Ecluster.name=kubernetes", "-Ebootstrap.memory_lock=true"]
+        env:
+        - name: ES_JAVA_OPTS
+          value: "-Xms512m -Xmx512m"
+        ports:
+        - containerPort: 9200
+---
+apiVersion: apps/v1
+kind: Service
+metadata:
+  name: kibana-k8s-logging
+  namespace: kube-instrumentation
+  labels:
+    app: kibana
+    function: logging
+spec:
+  selector:
+    app: kibana
+    function: logging
+  type: ClusterIP
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 5601
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: instrumentation-ingress
+  namespace: kube-instrumentation
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$1
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /kibana/?(.*)
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: kibana-k8s-logging
+            port:
+              number: 80
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kibana-k8s-logging
+  namespace: kube-instrumentation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kibana
+      function: logging
+  template:
+    metadata:
+      labels:
+        app: kibana
+        function: logging
+    spec:
+      containers:
+      - name: kibana
+        image: docker.elastic.co/kibana/kibana:5.5.1
+        env:
+          - name: ELASTICSEARCH_URL
+            value: http://es-k8s-logging:9200
+          - name: SERVER_BASEPATH
+            value: /kibana
+        ports:
+        - containerPort: 5601
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: filebeat-config
+  namespace: kube-instrumentation
+data:
+  filebeat.yaml: |
+    name: pod-logs
+    filebeat.prospectors:
+    - input_type: log
+      # This is not ideal as it assumes docker but currently is hardcoded in filebeat.
+      # If /var/log/containers/*.log is used then we don't get any "kubernetes.*" fields
+      # See https://discuss.elastic.co/t/kubernetes-metadata/90865/16
+      paths:
+        - /var/lib/docker/containers/*/*.log
+      symlinks: true
+      json.keys_under_root: true
+      json.add_error_key: true
+      json.message_key: log
+
+    processors:
+    - add_cloud_metadata:
+    - kubernetes:
+        in_cluster: true
+        namespace: kube-instrumentation
+
+    output.elasticsearch:
+      hosts: ['es-k8s-logging:9200']
+      username: elastic
+      password: changeme
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: filebeat-k8s-logging
+  namespace: kube-instrumentation
+  labels:
+    app: filebeat
+    function: logging
+spec:
+  selector:
+    matchLabels:
+      app: filebeat
+      function: logging
+  template:
+    metadata:
+      labels:
+        app: filebeat
+        function: logging
+      name: filebeat
+    spec:
+      serviceAccountName: filebeat
+      containers:
+      - name: filebeat
+        image: docker.elastic.co/beats/filebeat:6.0.0-alpha2
+        command: ["filebeat"]
+        args: ["-e", "-c", "/etc/filebeat/filebeat.yaml"]
+        resources:
+          limits:
+            cpu: 50m
+            memory: 50Mi
+        securityContext:
+          privileged: true
+          runAsUser: 0
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log/containers
+          readOnly: true
+        - name: varlogpods
+          mountPath: /var/log/pods
+          readOnly: true
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+        - name: config-volume
+          mountPath: /etc/filebeat
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log/containers
+      - name: varlogpods
+        hostPath:
+          path: /var/log/pods
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers/
+      - name: config-volume
+        configMap:
+          name: filebeat-config
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: filebeat
+subjects:
+- kind: ServiceAccount
+  name: filebeat
+  namespace: kube-instrumentation
+roleRef:
+  kind: ClusterRole
+  name: filebeat
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: filebeat
+  labels:
+    app: filebeat
+rules:
+- apiGroups: [""] # "" indicates the core API group
+  resources:
+  - namespaces
+  - pods
+  verbs:
+  - get
+  - watch
+  - list
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: filebeat
+  namespace: kube-instrumentation
+  labels:
+    app: filebeat
